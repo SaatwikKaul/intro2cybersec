@@ -1,0 +1,103 @@
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix-2020-09}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{url}
+
+\title{\Large Predictable Session Token Generation in an Android Authentication APK}
+
+\author{
+\textbf{Author Names Omitted for Draft}\\
+University of Sydney\\
+\texttt{[add student emails here]}
+}
+
+\begin{document}
+
+\date{}
+\maketitle
+
+\begin{abstract}
+We analysed the provided Android application package (APK) to identify security-sensitive misuse of randomness in its authentication flow. APK analysis is necessary because Android apps are distributed as compiled packages rather than human-readable source code, so decompilation is required to inspect the manifest, activities, and session logic. Using static reverse engineering, we found that the application generates its session token with \texttt{java.util.Random}, which is unsuitable for authentication because it is deterministic rather than cryptographically secure. We describe the system and threat model, show how the weakness was discovered, explain a realistic attack path, and propose a concrete mitigation based on \texttt{java.security.SecureRandom}.
+\end{abstract}
+
+\section{Introduction}
+An APK (Android Package Kit) is the file format used to distribute and install Android applications. Because an APK contains compiled bytecode rather than the original source code, auditing requires decompilation to recover readable program logic and resources. In this case study, we decompiled the provided APK to inspect its authentication design and determine whether any values treated as random were suitable for their security role. Our goal was to identify one strong, validated randomness-related vulnerability that could be defended in presentation and tutorial Q\&A.
+
+\section{System and Threat Model}
+The application has three main code components: \texttt{MainActivity}, \texttt{Login}, and \texttt{Profile}. \texttt{MainActivity} collects a username and password and writes them into \texttt{credentials.txt}. \texttt{Login} reads the stored credentials, checks the submitted pair, generates a session token after successful authentication, and stores that token in \texttt{SharedPreferences}. \texttt{Profile} is the post-login screen and removes the stored token on logout. From the APK, the app appears to rely entirely on local device storage rather than a visible backend service.
+
+The protected assets in this system are the username/password pair, the session token, and the app's authentication state. The key data flow is: registration writes credentials to local storage, login reads those credentials, a successful login generates a session token, and that token is then stored as the app's session state.
+
+Our threat model focuses on an external technical attacker who can reverse engineer the APK and inspect the authentication logic. A realistic stronger version of this attacker can also run the app on a rooted or emulated device and inspect local storage, logs, and runtime behaviour. The attacker's goal is to predict, recover, replay, or forge a valid session token in order to impersonate a legitimate logged-in user. This model directly matches the chosen vulnerability because the session token is generated on the client and trusted as authentication state.
+
+\section{How We Found the Vulnerability}
+We used static analysis after decompiling the APK with \texttt{jadx}. AI assistance was used to help select tooling and organise the reverse engineering workflow; the detailed interaction log is recorded separately in the required AI log. We then inspected the manifest and application classes and searched the decompiled sources for keywords such as \texttt{Random}, \texttt{sessionToken}, \texttt{createSession}, and \texttt{nextInt}.
+
+This process identified two random-like values in the app, shown in Table~\ref{tab:inventory}. Only one of them is security-sensitive.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Inventory of random-like values found in the APK.}
+\label{tab:inventory}
+\begin{tabular}{p{0.24\linewidth}p{0.22\linewidth}p{0.18\linewidth}p{0.18\linewidth}}
+\toprule
+\textbf{Location} & \textbf{Generator} & \textbf{Role} & \textbf{Assessment} \\
+\midrule
+\texttt{MainActivity.randomNumberGenerator()} & \texttt{Random().nextInt(100)} & UI/demo value & Not security-sensitive \\
+\texttt{Login.generateSessionToken()} & \texttt{Random()} + \texttt{nextInt(62)} & Session token & Weak and security-sensitive \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Vulnerability Details}
+The core vulnerability is in \texttt{Login.generateSessionToken()}, where the application generates a session token using \texttt{java.util.Random}. The token is created during session setup in \texttt{Login.createSession()} and then stored in \texttt{SharedPreferences}. This is unsafe because \texttt{java.util.Random} is a deterministic general-purpose pseudorandom number generator, not a cryptographically secure source of randomness.
+
+In this app, the token is not cosmetic or UI-only. It is used as the post-login session state, so its security role is authentication-related. The system therefore assumes that the token is hard to guess or reproduce. That assumption fails if the token comes from a predictable PRNG. Once the attacker knows the generation algorithm and token format, the attack becomes a token prediction or token recovery problem rather than a true secret-guessing problem.
+
+\section{Exploitation Path}
+The attacker first decompiles the APK and locates \texttt{generateSessionToken()} in \texttt{Login.java}. From the code, the attacker learns that the token is 16 characters long and built from an alphanumeric alphabet using \texttt{Random.nextInt(62)}. In a rooted or emulated environment, the attacker can observe login timing and collect local clues about when a session was created. Because the generator is deterministic, the attacker can generate candidate outputs around the observed context. If the application trusts possession of that token as proof of session state, the attacker can attempt session hijacking or impersonation.
+
+\section{Fix and Mitigation}
+The direct fix is to replace \texttt{java.util.Random} with \texttt{java.security.SecureRandom} and generate at least 128 bits of entropy for the token. For example, the app can generate 16 random bytes and encode them using URL-safe Base64. This works because \texttt{SecureRandom} is designed for security-sensitive unpredictability, unlike \texttt{java.util.Random}, which is deterministic and unsuitable for authentication tokens.
+
+\begin{verbatim}
+private static final SecureRandom SECURE_RANDOM =
+    new SecureRandom();
+
+private String generateSessionToken() {
+    byte[] bytes = new byte[16];
+    SECURE_RANDOM.nextBytes(bytes);
+    return Base64.getUrlEncoder()
+        .withoutPadding()
+        .encodeToString(bytes);
+}
+\end{verbatim}
+
+As an additional engineering control, the vulnerable version should no longer be distributed and users should be upgraded to a patched release. Static application security testing and secure code review should also flag the use of non-cryptographic randomness for tokens, keys, or session identifiers before release.
+
+\section{Conclusion}
+APK analysis was necessary to recover the application's authentication logic and identify its security-sensitive randomness usage. Our analysis showed that the app generates session tokens with \texttt{java.util.Random}, creating a predictable authentication value that may be abused for session impersonation. Replacing that generator with \texttt{SecureRandom} is the key mitigation needed to restore the intended security property.
+
+\begin{thebibliography}{9}
+
+\bibitem{oracle-random}
+Oracle.
+\newblock \textit{Class Random}.
+\newblock \url{https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/Random.html}
+
+\bibitem{oracle-securerandom}
+Oracle.
+\newblock \textit{Class SecureRandom}.
+\newblock \url{https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/security/SecureRandom.html}
+
+\bibitem{owasp-mastg}
+OWASP.
+\newblock \textit{OWASP Mobile Application Security Testing Guide}.
+\newblock \url{https://mas.owasp.org/MASTG/}
+
+\end{thebibliography}
+
+\end{document}
